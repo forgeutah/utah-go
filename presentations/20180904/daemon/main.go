@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -16,10 +17,15 @@ var (
 	ctxCancelWait      = 3 * time.Second
 )
 
+type versionKey struct{}
+
 func main() {
 	// create a root context that all future contexts will derive from, so that this
 	// cancel func will propagate through all requests
 	ctx, cancelFunc := context.WithCancel(context.Background())
+
+	// seed context with appropriate values
+	ctx = context.WithValue(ctx, versionKey{}, os.Getenv("APP_VERSION"))
 
 	// listen for OS level signals to stop the program
 	signalChan := make(chan os.Signal, 1)
@@ -62,20 +68,31 @@ func main() {
 	// set up a separate internal server for handling health checks, pprof and
 	// other things you don't want to expose to the world
 	internalMux := http.NewServeMux()
+
 	// always return 200 for liveness
 	internalMux.HandleFunc("/liveness", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
+
 	// for readiness checks, you might check connectivity to databases or other network services
 	// we'll also add a ready bool so we can turn it off while shutting down
 	ready := true
+	readyMu := sync.Mutex{}
+
 	internalMux.HandleFunc("/readiness", func(w http.ResponseWriter, r *http.Request) {
-		if ready {
+		// lock the mutex to prevent race conditions during shutdown
+		readyMu.Lock()
+		isReady := ready
+		readyMu.Unlock()
+
+		if isReady {
 			w.WriteHeader(http.StatusOK)
 		} else {
 			w.WriteHeader(http.StatusServiceUnavailable)
 		}
 	})
+
+	// start the internal server
 	internalServer := http.Server{
 		Addr:    ":" + os.Getenv("INTERNAL_PORT"),
 		Handler: internalMux,
@@ -97,7 +114,9 @@ func main() {
 	<-signalChan
 
 	// make readiness check start failing so load balancers will stop sending requests here
+	readyMu.Lock()
 	ready = false
+	readyMu.Unlock()
 
 	// first we want to gracefully shut down the main server but leave the internal server running.
 	// we can't guarantee how long the shutdown will take if there are long-running / misbehaving requests,
@@ -117,7 +136,9 @@ func main() {
 	select {
 	case err := <-shutdownChan:
 		if err != nil {
-			fmt.Println(err)
+			fmt.Println("shutdown finished with an error:", err)
+		} else {
+			fmt.Println("shutdown finished successfully")
 		}
 	case <-t.C:
 		fmt.Println("shutdown timed out")
